@@ -95,8 +95,9 @@ def _capture_screen() -> tuple[bytes, str]:
         raise RuntimeError("mss is not installed. Run: pip install mss")
 
     with mss.mss() as sct:
-        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
+        monitors = sct.monitors
+        # CORREÇÃO: Agora forçamos ela a pegar o índice [0], que junta TODOS os monitores numa imagem só.
+        target   = monitors[0] 
         shot     = sct.grab(target)
         png      = mss.tools.to_png(shot.rgb, shot.size)
 
