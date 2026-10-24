@@ -758,7 +758,7 @@ TOOL = {
                 "type": "STRING",
                 "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | screen_find | screen_click | random_data | user_data"
             },
-            "app_name": {
+            "app_name": {''
                 "type": "STRING",
                 "description": "For close_app: the application to close. Any application running works."
             },

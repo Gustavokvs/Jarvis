@@ -66,12 +66,15 @@ def controlar_whatsapp_desktop(
             
             time.sleep(4) # Aguarda o app abrir
             
-            if _PYAUTOGUI:
+            if _PYAUTOGUI and _PYPERCLIP:
                 # Atalho universal de pesquisa no WhatsApp
-                pyautogui.hotkey("ctrl", "f")
+                hotkey_cmd = "command" if platform.system() == "Darwin" else "ctrl"
+                pyautogui.hotkey(hotkey_cmd, "f")
                 time.sleep(1)
-                # Digita o nome do contato
-                pyautogui.write(destinatario, interval=0.05)
+                # Usa colar para o nome do contato para evitar erros com acentos/caracteres
+                pyperclip.copy(destinatario)
+                time.sleep(0.3)
+                pyautogui.hotkey(hotkey_cmd, "v")
                 time.sleep(2) # Espera a busca carregar
                 pyautogui.press("enter")
                 time.sleep(1) # Espera entrar no chat do contato
