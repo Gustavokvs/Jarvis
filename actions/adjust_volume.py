@@ -11,7 +11,7 @@ def adjust_volume(parameters, response=None, player=None, session_memory=None) -
         level_int = int(level)
         # Assuming player.set_volume is the method to adjust volume
         # player.set_volume(level_int)
-        return outcome.done("adjust_volume", f"Volume set to {level_int}")
+        return outcome.done("adjust_volume", message=f"Volume set to {level_int}")
     except ValueError:
         return outcome.failed("adjust_volume", "Parameter 'level' must be an integer")
     except Exception as e:

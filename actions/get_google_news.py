@@ -33,10 +33,10 @@ def get_google_news(parameters, response=None, player=None, session_memory=None)
             articles.append(f"Título: {title}\nLink: {link}\nResumo: {summary}\n")
 
         if not articles:
-            return outcome.done("get_google_news", f"Nenhuma notícia encontrada para o tópico: {topic}.")
+            return outcome.done("get_google_news", message=f"Nenhuma notícia encontrada para o tópico: {topic}.")
 
         final_result = f"Últimas notícias sobre {topic}:\n\n" + "\n".join(articles)
-        return outcome.done("get_google_news", final_result)
+        return outcome.done("get_google_news", message=final_result)
 
     except Exception as e:
         return outcome.failed("get_google_news", f"Erro ao buscar notícias: {str(e)}")

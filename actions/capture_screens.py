@@ -12,7 +12,7 @@ def capture_screens(parameters, response=None, player=None, session_memory=None)
             {"id": 2, "resolution": "2560x1440", "primary": False}
         ]
         
-        return outcome.done(skill_name, f"Captured information for {len(screens_info)} screens.", screens_info)
+        return outcome.done(skill_name, info=f"Captured information for {len(screens_info)} screens.", screens=screens_info)
     except Exception as e:
         return outcome.failed(skill_name, f"Failed to capture screen information: {str(e)}")
 
