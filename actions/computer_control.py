@@ -1,5 +1,7 @@
 #computer_control.py
 import io
+import threading
+from core import tts
 import json
 import platform
 import re
@@ -611,6 +613,7 @@ def computer_control(
     """
     params = parameters or {}
     action = params.get("action", "").lower().strip()
+    
 
     if not action:
         return "No action specified for computer_control."
