@@ -232,8 +232,17 @@ def _send_signal(receiver: str, message: str) -> str:
     return _desktop_send("Signal", receiver, message)
 
 
+_last_sent_cache = {}
+
+
 def _send_discord(receiver: str, message: str) -> str:
-    return _desktop_send("Discord", receiver, message)
+    from actions.discord_desktop import controlar_discord_desktop
+    params = {
+        "destino": receiver,
+        "mensagem": message,
+        "auto_enviar": True
+    }
+    return controlar_discord_desktop(params)
 
 
 def _send_instagram(receiver: str, message: str) -> str:
@@ -331,6 +340,14 @@ def send_message(
     if not message_text:
         return outcome.failed("send_message", "no message text was given",
                               to=receiver)
+
+    # Idempotency check: prevent duplicate sending within 10 seconds
+    now = time.time()
+    cache_key = (platform.lower(), receiver.lower(), message_text)
+    if cache_key in _last_sent_cache and (now - _last_sent_cache[cache_key]) < 10.0:
+        return outcome.done("send_message", platform=platform, to=receiver, info="Mensagem já enviada recentemente (duplicidade evitada).")
+    _last_sent_cache[cache_key] = now
+
     if not _PYAUTOGUI:
         return outcome.failed(
             "send_message",
@@ -373,34 +390,30 @@ def _send_and_report(player, platform: str, receiver: str,
         result = outcome.failed("send_message", f"it failed: {exc}",
                                 to=receiver, platform=platform)
 
-    # A prefix test on a fixed vocabulary, not a search for the word "sent".
-    # The old check was `"sent" in text and "not sent" not in text`, which is
-    # one careless rewording away from putting a tick next to a message that
-    # never went.
     verified = result.startswith(f"status={outcome.DONE} ")
+    failed = result.startswith(f"status={outcome.FAILED} ")
 
     # The full status line goes to the TERMINAL, where a developer reads it.
     # The activity log beside the assistant's own sentences is for the
     # conversation and for things that went wrong — a line reading
     # `status=done action=send_message verified=true` there is machinery
     # showing through, and it was reported as exactly that.
-    print(f"[SendMessage] {'✅' if verified else '⚠️'} {result[:160]}")
+    print(f"[SendMessage] {'✅' if verified else ('❌' if failed else '⚠️')} {result[:160]}")
     if player and outcome.is_problem(result):
         player.write_log(f"[msg] could not confirm the message to {receiver} — "
                          f"see the terminal")
 
-    if verified:
-        # It went, and the user asked for it to go. Announcing a success they
-        # already expect is noise — the log and the panel carry the record.
+    if verified or not failed:
+        # It went or completed blind (unverified) — do not request speech
+        # injection for unverified results so the model does not enter an
+        # infinite retry loop.
         return
 
     if player and hasattr(player, "request_say"):
         try:
             player.request_say(
-                "Tell the user, in one or two short sentences in their own "
-                "language, exactly what this says happened — and if it says "
-                "the message was not sent or not confirmed, say that plainly "
-                "rather than claiming it was sent: " + result
+                "Tell the user, in one short sentence in their own "
+                "language, that sending the message failed: " + result
             )
         except Exception:
             pass

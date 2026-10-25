@@ -15,6 +15,9 @@ pyautogui = LazyModule("pyautogui")
 pyperclip = LazyModule("pyperclip")
 
 
+_last_sent_cache = {}
+
+
 def controlar_whatsapp_desktop(
     parameters, response=None, player=None, session_memory=None
 ) -> str:
@@ -26,6 +29,13 @@ def controlar_whatsapp_desktop(
 
     if not destinatario or not mensagem:
         return outcome.failed("whatsapp_desktop", "Destinatário e mensagem são obrigatórios.")
+
+    # Idempotency check: prevent duplicate sending within 10 seconds
+    now = time.time()
+    cache_key = (destinatario.lower(), mensagem)
+    if cache_key in _last_sent_cache and (now - _last_sent_cache[cache_key]) < 10.0:
+        return outcome.done("whatsapp_desktop", info=f"Mensagem para {destinatario} já foi enviada recentemente (evitado envio duplicado).")
+    _last_sent_cache[cache_key] = now
 
     try:
         # Voz proativa
@@ -102,7 +112,6 @@ def controlar_whatsapp_desktop(
             "whatsapp_desktop", f"Erro ao manipular o WhatsApp Desktop: {str(e)}"
         )
 
-
 TOOL = {
     "name": "whatsapp_desktop",
     "description": (
@@ -112,7 +121,8 @@ TOOL = {
         "Se o usuário pedir para 'procurar o contato' e mandar mensagem, USE ESTA FERRAMENTA, passando o nome no destinatário. NUNCA diga que não consegue procurar contatos. "
         "Atenção à variável 'auto_enviar': "
         "Se o usuário disser 'escreva, prepare, deixe pronto, não envie', defina auto_enviar como FALSE. "
-        "Se o usuário disser 'mande, envie, dispara', defina auto_enviar como TRUE."
+        "Se o usuário disser 'mande, envie, dispara', defina auto_enviar como TRUE. "
+        "Call this tool exactly once per request. Never repeat or call in a loop."
     ),
     "tier": "core",
     "parameters": {

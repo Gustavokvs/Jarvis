@@ -43,6 +43,7 @@ import time
 import json
 import sys
 import traceback
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -72,6 +73,7 @@ from core import outcome
 from core.action_loader import strip_meta
 from actions.screen_processor import _capture_camera, _capture_screen
 from actions.system_monitor import SystemMonitor, get_system_status
+from core.ram_optimizer import RAMOptimizerEngine
 from actions.proactive import ProactiveEngine
 from actions.background_monitor import (
     add_monitor,
@@ -398,6 +400,58 @@ def _clean_transcript(text: str) -> str:
     return text.strip()
 
 
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize('NFKD', text)
+    no_accent = ''.join([c for c in nfkd if not unicodedata.combining(c)])
+    cleaned = re.sub(r'[^\w\s]', '', no_accent.lower())
+    return ' '.join(cleaned.split())
+
+
+def _is_sleep_command(text: str) -> bool:
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    if any(k in norm for k in ["dormi mal", "dormi pouco", "dormi tarde", "dormiu"]):
+        return False
+    sleep_patterns = [
+        r"\bdorme\b",
+        r"\bvai dormir\b",
+        r"\bpode dormir\b",
+        r"\bpara de me ouvir\b",
+        r"\bnao me escuta\b",
+        r"\bnao me escute\b",
+        r"\bfica em silencio\b",
+        r"\bfique em silencio\b",
+        r"\bsilencio\b",
+        r"\bdesliga\b",
+        r"\bvai descansar\b"
+    ]
+    return any(bool(re.search(p, norm)) for p in sleep_patterns)
+
+
+def _is_wake_command(text: str) -> bool:
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    wake_patterns = [
+        r"\bacorda\b",
+        r"\bta ai\b",
+        r"\bvoce ta ai\b",
+        r"\bei ramma\b",
+        r"\bhey ramma\b",
+        r"\bme escuta\b",
+        r"\bescuta aqui\b",
+        r"\bfala comigo\b",
+        r"\bjarvis\b",
+        r"\bramma\b",
+        r"\boi ramma\b",
+        r"\bola ramma\b"
+    ]
+    return any(bool(re.search(p, norm)) for p in wake_patterns)
+
+
 TOOL_DECLARATIONS = [
     # ── Inline tools ─────────────────────────────────────────────────────────
     # These stay here (rather than in an actions/*.py TOOL dict) because their
@@ -474,6 +528,18 @@ TOOL_DECLARATIONS = [
                 },
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "sleep_jarvis",
+        "description": (
+            "Puts the assistant into sleep mode (stops listening to voice until woken up). "
+            "Call this when the user says (in ANY language): go to sleep, sleep, "
+            "stop listening, para de me ouvir, pode dormir, ramma dorme, etc."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
         },
     },
     {
@@ -626,7 +692,7 @@ class JarvisLive:
         self.ui = ui
         self._asst_name = "JARVIS"  # updated each session from config
         self.session = None
-        self.audio_in_queue = None
+        self.a_queue = None
         self.out_queue = None
         self._loop = None
         self._is_speaking = False
@@ -712,6 +778,7 @@ class JarvisLive:
         self._dashboard = None
         self._briefing_sent = False  # morning briefing fires once per process
         self._sys_monitor = SystemMonitor()  # persistent cooldown state
+        self._ram_optimizer = RAMOptimizerEngine(interval_seconds=300)
         self._proactive = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
@@ -815,7 +882,8 @@ class JarvisLive:
         self._awake = False
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
-        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
+        self._ensure_wake_detector()
+        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Jarvis' to wake me.")
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
@@ -1003,10 +1071,10 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
-        # Respect wake-word sleep: a typed command must not be answered while
+        # Respect sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
-        if self._wake_enabled and not self._awake:
+        if not self._awake:
             self.ui.write_log(
                 "SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first."
             )
@@ -1294,6 +1362,24 @@ class JarvisLive:
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
+            safety_settings=[
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                ),
+            ],
             # strip_meta drops this project's own `tier` / `brief` keys, which
             # exist for the local-engine tool budget and are not part of the
             # Gemini function-declaration schema — an unknown field there is a
@@ -1515,6 +1601,11 @@ class JarvisLive:
                 else:
                     result = "Specify action (add/remove/list) and a topic."
 
+            elif name == "sleep_jarvis":
+                self.ui.write_log("SYS: Sleep requested by voice.")
+                self.sleep(reason="you asked me to sleep")
+                result = "Going to sleep. Say 'Hey Jarvis' or tap wake to talk to me again."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
 
@@ -1651,10 +1742,16 @@ class JarvisLive:
             # detector, which runs its model in ITS OWN thread — the cost here is
             # only a queue push, so the audio path is never slowed. When wake word
             # is off (default) or we're awake, this is a single boolean check.
-            if self._wake_enabled and not self._awake:
-                det = self._wake_detector
-                if det is not None:
-                    det.feed(indata)
+            if not self._awake:
+                if self._wake_enabled:
+                    det = self._wake_detector
+                    if det is not None:
+                        det.feed(indata)
+                if not self.ui.muted and not self._phone_active:
+                    data = indata.tobytes()
+                    loop.call_soon_threadsafe(
+                        self.out_queue.put_nowait, {"data": data, "mime_type": "audio/pcm"}
+                    )
                 return
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
@@ -1834,8 +1931,8 @@ class JarvisLive:
                             self._resume_handle = _sru.new_handle
 
                     if response.data:
-                        if self._interrupted:
-                            pass  # discard: interrupted
+                        if self._interrupted or not self._awake:
+                            pass  # discard: interrupted or sleeping
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
@@ -1874,9 +1971,24 @@ class JarvisLive:
                                 continue
 
                             # --- PROCESSA A FALA DO USUÁRIO ---
-                            
+
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                if not self._awake:
+                                    if _is_wake_command(full_in):
+                                        self.wake(reason=f"wake command: {full_in}")
+                                    else:
+                                        in_buf = []
+                                        out_buf = []
+                                        continue
+                                else:
+                                    if _is_sleep_command(full_in):
+                                        self.ui.write_log(f"You: {full_in}")
+                                        self.sleep(reason=f"sleep command: {full_in}")
+                                        in_buf = []
+                                        out_buf = []
+                                        continue
+
                                 self._last_out_logged = ""  # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
@@ -2323,6 +2435,17 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Monitor] ⚠️ Could not send alert: {e}")
 
+    async def _run_ram_optimizer(self) -> None:
+        """Background task: periodically optimize RAM and trim heap usage."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                res = await asyncio.to_thread(self._ram_optimizer.run_check)
+                if res and res.get("success") and res.get("freed_mb", 0) > 1.0:
+                    print(f"[RAM Optimizer] Freed {res['freed_mb']} MB (RAM used: {res['ram_used_gb']} GB, {res['ram_percent']}%)")
+            except Exception as e:
+                print(f"[RAM Optimizer] ⚠️ {e}")
+
     # ── Background monitor ──────────────────────────────────────────────────────
 
     async def _run_background_monitor(self) -> None:
@@ -2737,6 +2860,7 @@ class JarvisLive:
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
+                    tg.create_task(self._run_ram_optimizer())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
