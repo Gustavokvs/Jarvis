@@ -49,4 +49,5 @@ logs/
 downloads/
 screenshots/
 config/api_keys.json
-backups_ia/
+backups_ia/whatsapp_session/
+temp/
