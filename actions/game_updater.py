@@ -630,6 +630,549 @@ def _get_download_status(steam_path: Path) -> str:
     return " ".join(lines) if lines else "No active downloads or pending updates."
 
 
+def _launch_steam_game(steam_path: Path, game_name: str = None, app_id: str = None) -> str:
+    """
+    Protocolo robusto de execução de jogos Steam (duas camadas):
+
+    CAMADA 1 - GUI Automation (Primária):
+    1. Garantir Steam rodando e janela ativa
+    2. Navegar para aba 'Biblioteca' (Library)
+    3. Localizar campo de pesquisa 'Search' e inserir game_name
+    4. Identificar jogo nos resultados filtrados e selecioná-lo
+    5. Acionar botão 'Jogar' / 'Play'
+
+    CAMADA 2 - URI Protocol (Fallback/Contingência):
+    - Se GUI falhar: steam://run/<app_id> direto
+    """
+    if not _ensure_steam_running(steam_path):
+        return "Could not start Steam."
+
+    exe = _steam_exe(steam_path)
+    installed_games = _get_steam_games(steam_path)
+
+    target_game = None
+    if app_id:
+        target_game = next((g for g in installed_games if g["id"] == str(app_id)), None)
+    elif game_name:
+        name_lower = game_name.lower()
+        target_game = next((g for g in installed_games if name_lower in g["name"].lower()), None)
+    else:
+        return "Please specify a game name or AppID."
+
+    if not target_game:
+        return f"Game '{game_name or app_id}' not found in installed Steam games."
+
+    state = target_game["state"]
+    name = target_game["name"]
+    game_id = target_game["id"]
+
+    if state == 1026:
+        return f"'{name}' is currently downloading/updating. Wait for it to finish."
+    if state not in (4, 6, 516):
+        return f"'{name}' is not ready to launch (state: {state})."
+
+    print(f"[GameUpdater] 🎮 Iniciando protocolo de lançamento para {name} (AppID: {game_id})")
+
+    # --- CAMADA 1: GUI AUTOMATION (PRIMÁRIA) ---
+    if is_windows():
+        gui_success = _launch_via_gui_automation(steam_path, exe, name, game_id)
+        if gui_success:
+            # Após lançar, tentar lidar com launcher específico do jogo (GTA V, Cyberpunk, etc.)
+            time.sleep(3)
+            try:
+                _handle_game_launcher_ui(name)
+            except Exception as e:
+                print(f"[GameUpdater] ⚠️ Launcher UI handling failed: {e}")
+            return f"Launched '{name}' via GUI automation."
+
+    # --- CAMADA 2: URI PROTOCOL (FALLBACK) ---
+    print(f"[GameUpdater] 🔄 Fallback: usando URI protocol steam://run/{game_id}")
+    try:
+        _launch_steam_url(exe, f"steam://run/{game_id}")
+        time.sleep(3)
+        if is_windows():
+            try:
+                _handle_game_launcher_ui(name)
+            except Exception as e:
+                print(f"[GameUpdater] ⚠️ Launcher UI handling failed: {e}")
+        return f"Launched '{name}' via URI protocol (fallback)."
+    except Exception as e:
+        return f"Failed to launch '{name}': {e}"
+
+
+def _launch_via_gui_automation(steam_path: Path, exe: Path, game_name: str, game_id: str) -> bool:
+    """
+    Executa fluxo completo de GUI Automation no Steam:
+    1. Foca/restaura janela Steam
+    2. Clica aba 'Library' / 'Biblioteca'
+    3. Foca campo 'Search' / 'Pesquisar' e digita game_name
+    4. Seleciona o jogo nos resultados
+    5. Clica botão 'Play' / 'Jogar'
+    """
+    try:
+        import pygetwindow as gw
+        import pyautogui
+        pyautogui.FAILSAFE = False
+    except ImportError:
+        print("[GameUpdater] ⚠️ pygetwindow/pyautogui não disponível")
+        return False
+
+    # --- 1. LOCALIZAR E ATIVAR JANELA STEAM ---
+    steam_win = None
+    for _ in range(10):  # Wait up to 5 seconds
+        for w in gw.getAllWindows():
+            if w.width > 400 and w.height > 300 and w.visible:
+                title_lower = w.title.lower()
+                if "steam" in title_lower and ("library" in title_lower or "biblioteca" in title_lower or "store" in title_lower or "home" in title_lower or title_lower.strip() == "steam"):
+                    steam_win = w
+                    break
+        if steam_win:
+            break
+        time.sleep(0.5)
+
+    # Se não achou janela aberta, tentar restaurar da system tray ou reabrir
+    if not steam_win:
+        print("[GameUpdater] 🔍 Steam window not found, trying to restore from tray...")
+        if not _restore_steam_from_tray():
+            print("[GameUpdater] ⚠️ Could not restore Steam window")
+            return False
+        time.sleep(2)
+        for w in gw.getAllWindows():
+            if w.width > 400 and w.height > 300 and w.visible and "steam" in w.title.lower():
+                steam_win = w
+                break
+
+    if not steam_win:
+        print("[GameUpdater] ❌ Steam window not found after restore attempt")
+        return False
+
+    print(f"[GameUpdater] 🖥️ Steam window found: {steam_win.title} ({steam_win.width}x{steam_win.height})")
+
+    try:
+        steam_win.activate()
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    wx, wy = steam_win.left, steam_win.top
+    ww, wh = steam_win.width, steam_win.height
+
+    # --- 2. NAVEGAR PARA ABA 'BIBLIOTECA' / 'LIBRARY' ---
+    if not _click_steam_tab(steam_win, ["library", "biblioteca"]):
+        print("[GameUpdater] ⚠️ Could not click Library tab, trying keyboard shortcut...")
+        # Ctrl+2 geralmente abre Library no Steam
+        pyautogui.hotkey('ctrl', '2')
+        time.sleep(1)
+
+    time.sleep(1)
+
+    # --- 3. LOCALIZAR CAMPO DE PESQUISA E DIGITAR NOME DO JOGO ---
+    search_clicked = _click_steam_search_field(steam_win)
+    if not search_clicked:
+        print("[GameUpdater] ⚠️ Could not click search field, trying keyboard...")
+        # Ctrl+F ou Ctrl+K para focar search
+        pyautogui.hotkey('ctrl', 'f')
+        time.sleep(0.3)
+
+    # Limpar campo e digitar nome do jogo
+    pyautogui.hotkey('ctrl', 'a')
+    time.sleep(0.1)
+    pyautogui.press('delete')
+    time.sleep(0.1)
+    pyautogui.typewrite(game_name, interval=0.02)
+    time.sleep(1.5)  # Aguardar resultados filtrados
+
+    # --- 4. SELECIONAR JOGO NOS RESULTADOS ---
+    if not _select_game_in_results(steam_win, game_name):
+        print("[GameUpdater] ⚠️ Could not select game in results, trying Enter...")
+        pyautogui.press('enter')
+        time.sleep(1)
+
+    # --- 5. CLICAR BOTÃO 'PLAY' / 'JOGAR' ---
+    if not _click_play_button(steam_win, game_name):
+        print("[GameUpdater] ⚠️ Could not click Play button")
+        return False
+
+    print(f"[GameUpdater] ✅ GUI Automation successful for {game_name}")
+    return True
+
+
+def _restore_steam_from_tray() -> bool:
+    """Tenta restaurar Steam da system tray via pywinauto ou pyautogui."""
+    try:
+        from pywinauto import Application, findwindows
+        # Procurar ícone na system tray
+        for _ in range(5):
+            try:
+                hwnds = findwindows.find_windows(title_re=r"(?i)steam", visible_only=False)
+                for hwnd in hwnds:
+                    try:
+                        app = Application(backend="uia").connect(handle=hwnd)
+                        win = app.window(handle=hwnd)
+                        if win.exists():
+                            # Tentar restaurar
+                            win.restore()
+                            win.set_focus()
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            time.sleep(0.5)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: clicar na área da system tray (canto inferior direito)
+    try:
+        import pyautogui
+        import pygetwindow as gw
+        # Tentar achar ícone do Steam na tray
+        screen_w, screen_h = pyautogui.size()
+        # Área típica da system tray (canto inferior direito)
+        pyautogui.click(screen_w - 100, screen_h - 30, button='right')
+        time.sleep(0.3)
+        # Procurar menu "Open Steam" / "Abrir Steam"
+        pyautogui.press('up')
+        time.sleep(0.2)
+        pyautogui.press('enter')
+        time.sleep(1)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _click_steam_tab(steam_win, tab_keywords: list[str]) -> bool:
+    """Clica na aba especificada (Library/Biblioteca) na janela do Steam."""
+    try:
+        import pyautogui
+        import pygetwindow as gw
+        import numpy as np
+
+        wx, wy = steam_win.left, steam_win.top
+        ww, wh = steam_win.width, steam_win.height
+
+        # Screenshot da área superior (tabs)
+        tab_region_h = int(wh * 0.15)
+        screenshot = pyautogui.screenshot(region=(wx, wy, ww, tab_region_h))
+        img = np.array(screenshot)
+
+        # Usar OCR simples via template matching ou detecção de texto
+        # Por simplicidade, usar posições conhecidas relativas
+        # Tabs geralmente ficam no topo: Store, Library, Community, etc.
+
+        # Tentar clicar em posições conhecidas das tabs (relative)
+        # Library costuma ser a 2ª tab (índice 1)
+        tab_y = wy + tab_region_h // 2
+        tab_positions = [
+            wx + ww * 0.15,  # Store
+            wx + ww * 0.28,  # Library
+            wx + ww * 0.41,  # Community
+        ]
+
+        # Clicar na posição da Library tab
+        pyautogui.click(tab_positions[1], tab_y)
+        return True
+
+    except Exception as e:
+        print(f"[GameUpdater] ⚠️ Tab click failed: {e}")
+        return False
+
+
+def _click_steam_search_field(steam_win) -> bool:
+    """Localiza e clica no campo de pesquisa da Biblioteca."""
+    try:
+        import pyautogui
+        import pygetwindow as gw
+        import numpy as np
+        import cv2
+
+        wx, wy = steam_win.left, steam_win.top
+        ww, wh = steam_win.width, steam_win.height
+
+        # Screenshot da área superior da biblioteca (onde fica o search)
+        search_region_h = int(wh * 0.2)
+        screenshot = pyautogui.screenshot(region=(wx, wy, ww, search_region_h))
+        img = np.array(screenshot)
+        h, w = img.shape[:2]
+
+        # Converter para escala de cinza
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        # Procurar por ícone de lupa / search box (área clara retangular no topo)
+        # O campo de search costuma ser uma barra larga no topo central
+        search_y1, search_y2 = int(h * 0.05), int(h * 0.6)
+        search_x1, search_x2 = int(w * 0.2), int(w * 0.8)
+        search_area = gray[search_y1:search_y2, search_x1:search_x2]
+
+        # Threshold para encontrar área clara (campo de input)
+        _, thresh = cv2.threshold(search_area, 200, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_box = None
+        best_area = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 1000 < area < 50000:
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = bw / bh if bh > 0 else 0
+                if 5 < aspect < 30:  # Campo de search é bem largo
+                    if area > best_area:
+                        best_area = area
+                        best_box = (x, y, bw, bh)
+
+        if best_box:
+            x, y, bw, bh = best_box
+            click_x = wx + search_x1 + x + bw // 2
+            click_y = wy + search_y1 + y + bh // 2
+            pyautogui.click(click_x, click_y)
+            return True
+
+        # Fallback: posição relativa conhecida (topo centro)
+        fallback_x = wx + ww // 2
+        fallback_y = wy + int(wh * 0.08)
+        pyautogui.click(fallback_x, fallback_y)
+        return True
+
+    except ImportError:
+        # Fallback sem OpenCV
+        try:
+            import pyautogui
+            wx, wy = steam_win.left, steam_win.top
+            ww, wh = steam_win.width, steam_win.height
+            pyautogui.click(wx + ww // 2, wy + int(wh * 0.08))
+            return True
+        except Exception:
+            return False
+    except Exception as e:
+        print(f"[GameUpdater] ⚠️ Search field click failed: {e}")
+        return False
+
+
+def _select_game_in_results(steam_win, game_name: str) -> bool:
+    """Seleciona o jogo nos resultados da pesquisa (primeiro resultado visível)."""
+    try:
+        import pyautogui
+        import pygetwindow as gw
+        import numpy as np
+        import cv2
+
+        wx, wy = steam_win.left, steam_win.top
+        ww, wh = steam_win.width, steam_win.height
+
+        # Screenshot da área de resultados (abaixo do search)
+        results_y1 = int(wh * 0.15)
+        results_h = int(wh * 0.7)
+        screenshot = pyautogui.screenshot(region=(wx, wy + results_y1, ww, results_h))
+        img = np.array(screenshot)
+        h, w = img.shape[:2]
+
+        # Procurar por itens de jogo (caixas com imagem + texto)
+        # Geralmente primeira linha de resultados
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        # Detectar primeira "linha" de resultado (área com contraste)
+        # Clicar no primeiro item visível (geralmente o mais relevante)
+        item_y = int(h * 0.15)  # Primeiro resultado
+        item_x = int(w * 0.1)   # Início da lista
+
+        # Clicar no primeiro resultado
+        click_x = wx + item_x
+        click_y = wy + results_y1 + item_y
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.5)
+
+        # Double-click para garantir seleção/abertura
+        pyautogui.click(click_x, click_y)
+        return True
+
+    except Exception as e:
+        print(f"[GameUpdater] ⚠️ Game selection failed: {e}")
+        return False
+
+
+def _click_play_button(steam_win, game_name: str) -> bool:
+    """Clica no botão Play/Jogar na página do jogo."""
+    try:
+        import pyautogui
+        import pygetwindow as gw
+        import numpy as np
+        import cv2
+
+        wx, wy = steam_win.left, steam_win.top
+        ww, wh = steam_win.width, steam_win.height
+
+        # Aguardar página do jogo carregar
+        time.sleep(2)
+
+        # Screenshot da área direita/inferior onde fica o botão Play
+        # Na página do jogo, o botão Play fica proeminente à direita
+        play_y1 = int(wh * 0.3)
+        play_x1 = int(ww * 0.5)
+        screenshot = pyautogui.screenshot(region=(wx + play_x1, wy + play_y1, ww - play_x1, wh - play_y1))
+        img = np.array(screenshot)
+        h, w = img.shape[:2]
+
+        # Converter para HSV para detectar botão verde/azul
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+
+        # Verde (Play button padrão Steam)
+        green_lower = np.array([35, 50, 50])
+        green_upper = np.array([85, 255, 255])
+        green_mask = cv2.inRange(hsv, green_lower, green_upper)
+
+        # Azul (alternativo)
+        blue_lower = np.array([100, 50, 50])
+        blue_upper = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv, blue_lower, blue_upper)
+
+        combined = green_mask | blue_mask
+
+        # Encontrar contornos de botões
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_btn = None
+        best_area = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 800 < area < 80000:
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = bw / bh if bh > 0 else 0
+                if 2 < aspect < 8:
+                    if area > best_area:
+                        best_area = area
+                        best_btn = (x, y, bw, bh)
+
+        if best_btn:
+            x, y, bw, bh = best_btn
+            click_x = wx + play_x1 + x + bw // 2
+            click_y = wy + play_y1 + y + bh // 2
+            pyautogui.click(click_x, click_y)
+            print(f"[GameUpdater] 🎮 Play button clicked at ({click_x}, {click_y})")
+            return True
+
+        # Fallback: posição conhecida do botão Play (lado direito, meio vertical)
+        fallback_x = wx + int(ww * 0.75)
+        fallback_y = wy + int(wh * 0.5)
+        pyautogui.click(fallback_x, fallback_y)
+        print(f"[GameUpdater] 🎮 Fallback Play click at ({fallback_x}, {fallback_y})")
+        return True
+
+    except Exception as e:
+        print(f"[GameUpdater] ⚠️ Play button click failed: {e}")
+        return False
+
+
+def _handle_game_launcher_ui(game_name: str) -> bool:
+    """Detect and click Play button in game launchers (GTA V, Cyberpunk, etc.)."""
+    try:
+        import pygetwindow as gw
+        import pyautogui
+        import numpy as np
+
+        # Wait for launcher window to appear
+        launcher_keywords = [
+            "launcher", "social club", "rockstar", "gta", "cyberpunk",
+            "red launcher", "epic games", "ubisoft connect", "ea app"
+        ]
+
+        launcher_win = None
+        for _ in range(20):  # Wait up to 10 seconds
+            time.sleep(0.5)
+            for w in gw.getAllWindows():
+                if w.width > 300 and w.height > 200 and w.visible:
+                    title_lower = w.title.lower()
+                    if any(kw in title_lower for kw in launcher_keywords):
+                        if game_name.lower() in title_lower or any(kw in title_lower for kw in ["play", "jogar", "launch", "iniciar"]):
+                            launcher_win = w
+                            break
+            if launcher_win:
+                break
+
+        if not launcher_win:
+            return False
+
+        print(f"[GameUpdater] 🎯 Launcher detected: {launcher_win.title}")
+        launcher_win.activate()
+        time.sleep(0.5)
+
+        # Take screenshot of launcher window
+        wx, wy = launcher_win.left, launcher_win.top
+        ww, wh = launcher_win.width, launcher_win.height
+        screenshot = pyautogui.screenshot(region=(wx, wy, ww, wh))
+        img = np.array(screenshot)
+        h, w = img.shape[:2]
+
+        # Look for "Play" / "Jogar" / "Launch" buttons (typically green/blue, bottom area)
+        search_y1, search_y2 = int(h * 0.5), h
+        search_x1, search_x2 = int(w * 0.1), int(w * 0.9)
+        region = img[search_y1:search_y2, search_x1:search_x2]
+
+        # Convert to HSV for better color detection
+        import cv2
+        hsv = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
+
+        # Green play button range (typical Steam/launcher play buttons)
+        green_lower = np.array([35, 50, 50])
+        green_upper = np.array([85, 255, 255])
+        green_mask = cv2.inRange(hsv, green_lower, green_upper)
+
+        # Blue play button range
+        blue_lower = np.array([100, 50, 50])
+        blue_upper = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv, blue_lower, blue_upper)
+
+        # Orange/red (some launchers)
+        red_lower1 = np.array([0, 50, 50])
+        red_upper1 = np.array([10, 255, 255])
+        red_lower2 = np.array([170, 50, 50])
+        red_upper2 = np.array([180, 255, 255])
+        red_mask = cv2.inRange(hsv, red_lower1, red_upper1) | cv2.inRange(hsv, red_lower2, red_upper2)
+
+        combined_mask = green_mask | blue_mask | red_mask
+
+        # Find contours (button-like shapes)
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_button = None
+        best_area = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 500 < area < 50000:  # Reasonable button size
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = bw / bh if bh > 0 else 0
+                if 1.5 < aspect < 6:  # Button-like aspect ratio
+                    if area > best_area:
+                        best_area = area
+                        best_button = (x, y, bw, bh)
+
+        if best_button:
+            x, y, bw, bh = best_button
+            # Click center of detected button
+            click_x = wx + search_x1 + x + bw // 2
+            click_y = wy + search_y1 + y + bh // 2
+            print(f"[GameUpdater] 🎮 Clicking Play button at ({click_x}, {click_y})")
+            pyautogui.click(click_x, click_y)
+            return True
+
+        # Fallback: click bottom center of launcher window (common Play button position)
+        fallback_x = wx + ww // 2
+        fallback_y = wy + int(wh * 0.85)
+        print(f"[GameUpdater] 🎮 Fallback click at ({fallback_x}, {fallback_y})")
+        pyautogui.click(fallback_x, fallback_y)
+        return True
+
+    except ImportError:
+        print("[GameUpdater] ⚠️ cv2/pyautogui not available for launcher UI")
+        return False
+    except Exception as e:
+        print(f"[GameUpdater] ⚠️ Launcher UI error: {e}")
+        return False
+
+
 def _system_shutdown() -> None:
     if is_windows():
         subprocess.run(["shutdown", "/s", "/t", "10"], **_CNW)
@@ -986,6 +1529,21 @@ def game_updater(parameters: dict, player=None, speak=None) -> str:
             results.append("Epic download status not available directly.")
         return " ".join(results)
 
+    if action == "launch":
+        if platform in ("steam", "both"):
+            steam_path = _find_steam_path()
+            if not steam_path:
+                results.append("Steam: Not installed.")
+            else:
+                if game_name or app_id:
+                    msg = _launch_steam_game(steam_path, game_name=game_name, app_id=app_id)
+                    results.append(f"Steam: {msg}")
+                else:
+                    results.append("Steam: Please specify a game name or AppID to launch.")
+        if platform in ("epic", "both"):
+            results.append("Epic launch not implemented yet.")
+        return " | ".join(results) or "Nothing to launch."
+
     if action in ("install", "update"):
         if platform in ("steam", "both"):
             steam_path = _find_steam_path()
@@ -1068,7 +1626,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "update | install | list | download_status | schedule | cancel_schedule | schedule_status (default: update)"
+                "description": "update | install | launch | list | download_status | schedule | cancel_schedule | schedule_status (default: update)"
             },
             "platform": {
                 "type": "STRING",

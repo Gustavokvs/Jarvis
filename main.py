@@ -134,7 +134,9 @@ LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 4096
+# Ganho de microfone (linear): 1.0 = original, 2.0 = +6dB, 3.0 = ~+9.5dB
+MIC_GAIN = 2.0
 
 # RMS below which 16-bit PCM is treated as room silence; above _LEVEL_FULL it
 # reads as a full-height waveform. Tuned so ordinary speech lands mid-range and
@@ -413,8 +415,14 @@ def _is_sleep_command(text: str) -> bool:
     norm = _normalize_text(text)
     if not norm:
         return False
-    if any(k in norm for k in ["dormi mal", "dormi pouco", "dormi tarde", "dormiu"]):
+    # Exclusões explícitas (frases que CONTÊM palavras de sleep mas NÃO são comando)
+    if any(k in norm for k in [
+        "dormi mal", "dormi pouco", "dormi tarde", "dormiu",
+        "ta ouvindo", "esta ouvindo", "voce me ouve", "me ouve",
+        "sim", "ok", "ta bom", "entendi", "entendido"
+    ]):
         return False
+    # Padrões EXPLÍCITOS de sleep - exigem verbo de comando claro
     sleep_patterns = [
         r"\bdorme\b",
         r"\bvai dormir\b",
@@ -424,7 +432,7 @@ def _is_sleep_command(text: str) -> bool:
         r"\bnao me escute\b",
         r"\bfica em silencio\b",
         r"\bfique em silencio\b",
-        r"\bsilencio\b",
+        r"\bsilencio total\b",  # mais específico que só "silencio"
         r"\bdesliga\b",
         r"\bvai descansar\b"
     ]
@@ -440,14 +448,19 @@ def _is_wake_command(text: str) -> bool:
         r"\bta ai\b",
         r"\bvoce ta ai\b",
         r"\bei ramma\b",
+        r"\bei rama\b",
         r"\bhey ramma\b",
+        r"\bhey rama\b",
         r"\bme escuta\b",
         r"\bescuta aqui\b",
         r"\bfala comigo\b",
         r"\bjarvis\b",
         r"\bramma\b",
+        r"\brama\b",
         r"\boi ramma\b",
-        r"\bola ramma\b"
+        r"\boi rama\b",
+        r"\bola ramma\b",
+        r"\bola rama\b"
     ]
     return any(bool(re.search(p, norm)) for p in wake_patterns)
 
@@ -1613,9 +1626,9 @@ class JarvisLive:
                     # --- SALVA O ESTADO ANTES DE GERAR O RESUMO E LIMPAR ---
                     if self._session_log:
                         try:
-                            from core.memoria_curta import salvar_estado
+                            from core.memoria_curta import flush
 
-                            salvar_estado(self._session_log)
+                            flush()
                         except Exception:
                             pass
 
@@ -1748,7 +1761,9 @@ class JarvisLive:
                     if det is not None:
                         det.feed(indata)
                 if not self.ui.muted and not self._phone_active:
-                    data = indata.tobytes()
+                    # Aplica ganho de microfone (software boost)
+                    boosted = np.clip(indata * MIC_GAIN, -32768, 32767).astype(np.int16)
+                    data = boosted.tobytes()
                     loop.call_soon_threadsafe(
                         self.out_queue.put_nowait, {"data": data, "mime_type": "audio/pcm"}
                     )
@@ -1802,7 +1817,9 @@ class JarvisLive:
                 return
 
             if not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
+                # Aplica ganho de microfone (software boost)
+                boosted = np.clip(indata * MIC_GAIN, -32768, 32767).astype(np.int16)
+                data = boosted.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait, {"data": data, "mime_type": "audio/pcm"}
                 )
@@ -1810,7 +1827,7 @@ class JarvisLive:
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
                 try:
-                    self.ui.set_audio_level(_pcm_level(indata))
+                    self.ui.set_audio_level(_pcm_level(boosted))
                 except Exception:
                     pass
 
@@ -1940,7 +1957,7 @@ class JarvisLive:
                             _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(
+                                await self.audio_in_queue.put(
                                     _audio_data[_i : _i + _SLICE]
                                 )
 
@@ -2418,7 +2435,7 @@ class JarvisLive:
     async def _run_system_monitor(self) -> None:
         """Background task: voice alerts when metrics exceed thresholds."""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
             alert = await asyncio.to_thread(self._sys_monitor.check)
             if not alert or not self.session or not self._awake:
                 continue
@@ -2438,8 +2455,10 @@ class JarvisLive:
     async def _run_ram_optimizer(self) -> None:
         """Background task: periodically optimize RAM and trim heap usage."""
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(60)  # era 300s - agora checa a cada 1min
             try:
+                # quick_gc é leve, roda sempre; run_check decide se faz otimização pesada
+                self._ram_optimizer.quick_gc()
                 res = await asyncio.to_thread(self._ram_optimizer.run_check)
                 if res and res.get("success") and res.get("freed_mb", 0) > 1.0:
                     print(f"[RAM Optimizer] Freed {res['freed_mb']} MB (RAM used: {res['ram_used_gb']} GB, {res['ram_percent']}%)")
@@ -2492,7 +2511,7 @@ class JarvisLive:
         to say proactively. No hardcoded rules — Gemini makes the call.
         """
         while True:
-            await asyncio.sleep(60)  # evaluate once per minute
+            await asyncio.sleep(120)  # evaluate every 2 minutes
 
             if not self.session or not self._awake:
                 continue
@@ -2793,8 +2812,8 @@ class JarvisLive:
                     session.send_client_content = _send_and_arm
 
                     self.session = session
-                    self.audio_in_queue = asyncio.Queue()
-                    self.out_queue = asyncio.Queue(maxsize=200)
+                    self.audio_in_queue = asyncio.Queue(maxsize=60)
+                    self.out_queue = asyncio.Queue(maxsize=100)
                     self._turn_done_event = asyncio.Event()
                     self._rx_deadline = None
 
@@ -2807,11 +2826,8 @@ class JarvisLive:
                     self._interrupted = False
 
                     print("[JARVIS] Connected.")
-                    if _resumed_with:
-                        # Say it plainly: the difference between "it reconnected"
-                        # and "it reconnected and still knows what we were doing"
-                        # is the whole point, and it is invisible otherwise.
-                        self.ui.write_log("SYS: Reconnected — conversation restored.")
+                    # NÃO loga "restored" aqui - o handle pode ainda ser rejeitado pelo servidor.
+                    # O exception handler abaixo loga o resultado real (sucesso silencioso ou falha explícita).
 
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
@@ -2891,9 +2907,21 @@ class JarvisLive:
                 # externally, which `except Exception` would miss, letting the
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
+
+                # SEMPRE extrai e loga a exceção REAL do ExceptionGroup
+                real_exc = e
+                if isinstance(e, BaseExceptionGroup):
+                    for sub in e.exceptions:
+                        print(f"[JARVIS] 💥 TaskGroup sub-exception: {type(sub).__name__}: {sub}")
+                        traceback.print_exception(type(sub), sub, sub.__traceback__)
+                        real_exc = sub  # usa a primeira pro fluxo de reconexão
+                    # Se só tem uma exception, usa ela diretamente
+                    if len(e.exceptions) == 1:
+                        real_exc = e.exceptions[0]
+
                 # Voluntary reconnect (voice change) — not an error. Rebuild the
                 # session immediately with no backoff and no scary logs.
-                if _is_reconnect_signal(e):
+                if _is_reconnect_signal(real_exc):
                     print("[JARVIS] Voluntary reconnect requested.")
                     if not _keep_context_of(e):
                         # A deliberate clean slate (voice change) — drop the

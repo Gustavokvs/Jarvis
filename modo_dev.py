@@ -75,15 +75,21 @@ def restaurar_snapshot(backups_feitos):
         shutil.copy2(arquivo_backup, arquivo_original)
         print(f"[Rollback ⏪] Arquivo {arquivo_original} restaurado para a versão funcional.")
 
+# Verifica se deve pular backup (para rodar via comando direto)
+SKIP_BACKUP = os.environ.get("SKIP_BACKUP") == "1" or os.environ.get("DEV_MODE_NO_BACKUP") == "1"
+
 print("=========================================================")
 print(" 🚀 MODO DEV BLINDADO [COM COLETA DE CRASH LOGS]")
 print(" 1. Ponto de Restauração Inicial")
 print(" 2. Proteção Anti-Autosave")
-print(" 3. Auto-Rollback em caso de falha fatal (Crash)")
+print(" 3. Auto'-Rollback em caso de falha fatal (Crash)")
 print(" 4. Log de Erros salvo automaticamente")
 print("=========================================================\n")
 
-criar_backup_geral()
+if not SKIP_BACKUP:
+    criar_backup_geral()
+else:
+    print("[Segurança 🛡️] BACKUP PULADO (SKIP_BACKUP=1)\n")
 processo = iniciar_ia()
 arquivos_anteriores = mapear_arquivos()
 
