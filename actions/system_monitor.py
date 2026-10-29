@@ -4,6 +4,7 @@ Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
 """
 import ctypes
 import platform
+import re
 import time
 
 import psutil
@@ -24,9 +25,12 @@ _CPU_STREAK = 3
 _nvml_lib: object = None
 _nvml_ok:  object = None   # None=untested  True=works  False=unavailable
 
+# Windows GPU performance counter cache (win32pdh)
+_win32pdh_ok: object = None  # None=untested, True=works, False=unavailable
+
 
 def _nvml_gpu() -> float:
-    """GPU utilisation via NVML — zero subprocess on all platforms."""
+    """GPU utilisation via NVML — zero subprocess on all platforms (NVIDIA only)."""
     global _nvml_lib, _nvml_ok
     if _nvml_ok is False:
         return -1.0
@@ -69,8 +73,79 @@ def _nvml_gpu() -> float:
         return -1.0
 
 
+def _win32pdh_gpu_usage() -> float:
+    """GPU utilisation via win32pdh (works for AMD/NVIDIA/Intel on Windows 10+).
+
+    Uses the pywin32 wrapper around PDH API to query the
+    \\GPU Engine(*)\\Utilization Percentage counter which reports per-engine
+    utilization for all GPUs. We aggregate the 3D engine utilization
+    for each physical GPU to get a total GPU usage percentage.
+    """
+    global _win32pdh_ok
+
+    if _win32pdh_ok is False:
+        return -1.0
+
+    try:
+        import win32pdh
+    except ImportError:
+        _win32pdh_ok = False
+        return -1.0
+
+    try:
+        # Query GPU Engine utilization for all instances
+        counter_path = r"\GPU Engine(*)\Utilization Percentage"
+
+        # Create query
+        hq = win32pdh.OpenQuery()
+
+        # Add counter for all instances
+        hc = win32pdh.AddCounter(hq, counter_path)
+
+        # Collect twice with interval
+        win32pdh.CollectQueryData(hq)
+        time.sleep(0.1)
+        win32pdh.CollectQueryData(hq)
+
+        # Get formatted counter array
+        items = win32pdh.GetFormattedCounterArray(hc, win32pdh.PDH_FMT_DOUBLE)
+
+        # Aggregate 3D engine utilization per physical GPU (by LUID)
+        # InstanceName format: pid_XXXX_luid_0x..._phys_0_eng_0_engtype_3D
+        gpu_usage = {}
+        for name, util in items.items():
+            if "engtype_3D" in name:
+                # Extract LUID to group by physical GPU
+                m = re.search(r"luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)", name)
+                if m:
+                    luid = f"{m.group(1)}_{m.group(2)}"
+                    gpu_usage[luid] = gpu_usage.get(luid, 0.0) + util
+
+        win32pdh.CloseQuery(hq)
+
+        if not gpu_usage:
+            _win32pdh_ok = False
+            return -1.0
+
+        _win32pdh_ok = True
+        # Return max GPU usage across all physical GPUs
+        return max(gpu_usage.values())
+
+    except Exception:
+        _win32pdh_ok = False
+        return -1.0
+
+
 def _get_gpu_usage() -> float:
-    # pynvml — subprocess-free, works everywhere if installed
+    """Get GPU usage - tries Windows win32pdh counters first (all GPUs),
+    then NVIDIA NVML (NVIDIA only), then pynvml (NVIDIA only)."""
+    # Windows win32pdh GPU counters work for AMD/NVIDIA/Intel on Windows 10+
+    if _OS == "Windows":
+        val = _win32pdh_gpu_usage()
+        if val >= 0:
+            return val
+
+    # pynvml — subprocess-free, works everywhere if installed (NVIDIA only)
     try:
         import pynvml  # type: ignore
         pynvml.nvmlInit()
@@ -79,6 +154,7 @@ def _get_gpu_usage() -> float:
     except Exception:
         pass
 
+    # NVML direct via ctypes (NVIDIA only)
     return _nvml_gpu()
 
 

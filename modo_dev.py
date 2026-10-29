@@ -5,9 +5,73 @@ import subprocess
 import shutil
 import ast
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 PASTA_BACKUP = "backups_ia"
+
+# Configurações de retenção de backups
+DIAS_RETENCAO = 7          # Mantém backups dos últimos 7 dias
+MAX_BACKUPS_COMPLETOS = 10 # Mantém no máximo 10 backups completos (ZIP)
+MAX_SNAPSHOTS = 50         # Mantém no máximo 50 snapshots individuais (.bak)
+
+def limpar_backups_antigos():
+    """Remove backups antigos baseado em idade e quantidade."""
+    if not os.path.exists(PASTA_BACKUP):
+        return
+
+    agora = datetime.now()
+    cutoff = agora - timedelta(days=DIAS_RETENCAO)
+
+    arquivos = []
+    for f in os.listdir(PASTA_BACKUP):
+        caminho = os.path.join(PASTA_BACKUP, f)
+        if os.path.isfile(caminho):
+            mtime = datetime.fromtimestamp(os.path.getmtime(caminho))
+            arquivos.append((f, caminho, mtime))
+
+    # Separar por tipo
+    zips = [(f, c, m) for f, c, m in arquivos if f.startswith("backup_completo_") and f.endswith(".zip")]
+    baks = [(f, c, m) for f, c, m in arquivos if f.endswith(".bak")]
+    logs = [(f, c, m) for f, c, m in arquivos if f == "ultimo_crash.log"]
+
+    removidos = 0
+
+    # 1. Remover por idade (mais antigos que DIAS_RETENCAO)
+    for f, caminho, mtime in zips + baks + logs:
+        if mtime < cutoff:
+            try:
+                os.remove(caminho)
+                removidos += 1
+                print(f"[Limpeza 🗑️] Removido antigo: {f}")
+            except OSError:
+                pass
+
+    # 2. Limitar quantidade de backups completos (manter os mais recentes)
+    zips_restantes = [(f, c, m) for f, c, m in zips if m >= cutoff]
+    zips_restantes.sort(key=lambda x: x[2], reverse=True)
+    for f, caminho, _ in zips_restantes[MAX_BACKUPS_COMPLETOS:]:
+        try:
+            os.remove(caminho)
+            removidos += 1
+            print(f"[Limpeza 🗑️] Limite ZIP excedido: {f}")
+        except OSError:
+            pass
+
+    # 3. Limitar quantidade de snapshots (manter os mais recentes)
+    baks_restantes = [(f, c, m) for f, c, m in baks if m >= cutoff]
+    baks_restantes.sort(key=lambda x: x[2], reverse=True)
+    for f, caminho, _ in baks_restantes[MAX_SNAPSHOTS:]:
+        try:
+            os.remove(caminho)
+            removidos += 1
+            print(f"[Limpeza 🗑️] Limite snapshot excedido: {f}")
+        except OSError:
+            pass
+
+    if removidos > 0:
+        print(f"[Limpeza 🗑️] Total removido: {removidos} arquivo(s)\n")
+    else:
+        print(f"[Limpeza 🗑️] Nenhum backup antigo para remover.\n")
 
 def criar_backup_geral():
     """Camada 1: Cria um arquivo ZIP de todo o projeto ao abrir o modo dev."""
@@ -84,7 +148,11 @@ print(" 1. Ponto de Restauração Inicial")
 print(" 2. Proteção Anti-Autosave")
 print(" 3. Auto'-Rollback em caso de falha fatal (Crash)")
 print(" 4. Log de Erros salvo automaticamente")
+print(" 5. Limpeza automática de backups antigos")
 print("=========================================================\n")
+
+# Limpeza de backups antigos (roda antes de criar novos)
+limpar_backups_antigos()
 
 if not SKIP_BACKUP:
     criar_backup_geral()

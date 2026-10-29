@@ -797,6 +797,10 @@ class JarvisLive:
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
         self._novas_mensagens_resumo = 0           # <--- ADICIONE ESTA LINHA (Contador de controle)
 
+        # Foreground/background tracking for CPU throttling
+        self._foreground = True  # True when window is focused/foreground
+        self.ui.set_focus_callback(self._on_focus_change)
+
         self._enhanced_live = (
             True  # proactive audio; auto-disabled if the server rejects it
         )
@@ -901,7 +905,8 @@ class JarvisLive:
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
         while True:
-            await asyncio.sleep(5)
+            # Throttle when not in foreground: check every 30s instead of 5s
+            await asyncio.sleep(5 if self._foreground else 30)
             if not self._wake_enabled or not self._awake:
                 continue
             with self._speaking_lock:
@@ -1045,6 +1050,14 @@ class JarvisLive:
         but the conversation is kept, which is the whole reason resumption
         landed before this feature did."""
         self.request_reconnect(keep_context=True, reason="audio device")
+
+    def _on_focus_change(self, is_active: bool):
+        """Called from UI thread when window focus changes."""
+        self._foreground = is_active
+        if is_active:
+            print("[JARVIS] Window focused - resuming normal operation")
+        else:
+            print("[JARVIS] Window unfocused - throttling background tasks")
 
     async def _watch_reconnect(self):
         """Session-scoped task: when a voluntary reconnect is requested, raise a
@@ -2092,8 +2105,14 @@ class JarvisLive:
                         )
                         await self._flush_pending_vision()
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
+            err = str(e)
+            print(f"[JARVIS] ❌ Recv: {err}")
             traceback.print_exc()
+            # 1008 GoAway = sessão expirou → força reconexão completa mantendo contexto
+            if "1008" in err or "GoAway" in err or "session durat" in err:
+                print("[JARVIS] 🔄 Sessão expirada (1008/GoAway) — forçando reconexão com contexto")
+                self.request_reconnect(keep_context=True, reason="session expired 1008")
+                return
             raise
 
     async def _play_audio(self):
@@ -2180,8 +2199,7 @@ class JarvisLive:
                 # level and let the HUD play it out in step with the audio.
                 try:
                     pcm = np.frombuffer(bytes(batch), dtype=np.int16)
-                    hop = _VIS_HOP / RECEIVE_SAMPLE_RATE
-                    frames = _pcm_visemes(pcm, sr=RECEIVE_SAMPLE_RATE)
+
                     # When does this batch become audible? The stream was
                     # started at launch and its callback has been pulling
                     # silence ever since, so the first bytes of a reply reach
@@ -2208,18 +2226,28 @@ class JarvisLive:
                     # yielded frames, so a block too short to analyse cannot
                     # shift everything after it out of step with the audio.
                     self._play_cursor += pcm.size / RECEIVE_SAMPLE_RATE
-                    if frames:
-                        frames = self._visemes.frames(frames, hop)
-                        self.ui.push_visemes(frames, hop, at)
-                        # Barge-in needs to know what we are playing, not just
-                        # how loud: the guard subtracts this from the microphone.
-                        self._out_level = max(f[0] for f in frames)
-                        self._echo.note_output(
-                            pcm, RECEIVE_SAMPLE_RATE, self._out_level
-                        )
+
+                    # Skip CPU-intensive viseme extraction (FFT) when not in foreground
+                    if self._foreground:
+                        hop = _VIS_HOP / RECEIVE_SAMPLE_RATE
+                        frames = _pcm_visemes(pcm, sr=RECEIVE_SAMPLE_RATE)
+                        if frames:
+                            frames = self._visemes.frames(frames, hop)
+                            self.ui.push_visemes(frames, hop, at)
+                            # Barge-in needs to know what we are playing, not just
+                            # how loud: the guard subtracts this from the microphone.
+                            self._out_level = max(f[0] for f in frames)
+                            self._echo.note_output(
+                                pcm, RECEIVE_SAMPLE_RATE, self._out_level
+                            )
+                        else:
+                            lvl = _pcm_level(pcm)
+                            self.ui.set_audio_level(lvl)
+                            self._out_level = lvl
+                            self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE, lvl)
                     else:
+                        # When backgrounded, just use simple level for echo guard
                         lvl = _pcm_level(pcm)
-                        self.ui.set_audio_level(lvl)
                         self._out_level = lvl
                         self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE, lvl)
                 except Exception:
@@ -2435,7 +2463,12 @@ class JarvisLive:
     async def _run_system_monitor(self) -> None:
         """Background task: voice alerts when metrics exceed thresholds."""
         while True:
-            await asyncio.sleep(30)
+            # Throttle when not in foreground: check every 2 min instead of 30s
+            sleep_interval = 30 if self._foreground else 120
+            await asyncio.sleep(sleep_interval)
+            # Skip alerts when not in foreground
+            if not self._foreground:
+                continue
             alert = await asyncio.to_thread(self._sys_monitor.check)
             if not alert or not self.session or not self._awake:
                 continue
@@ -2455,7 +2488,14 @@ class JarvisLive:
     async def _run_ram_optimizer(self) -> None:
         """Background task: periodically optimize RAM and trim heap usage."""
         while True:
-            await asyncio.sleep(60)  # era 300s - agora checa a cada 1min
+            # Throttle when not in foreground: check every 5 min instead of 1 min
+            sleep_interval = 60 if self._foreground else 300
+            await asyncio.sleep(sleep_interval)
+            # Skip heavy optimization when not in foreground
+            if not self._foreground:
+                # Only run quick GC when backgrounded
+                self._ram_optimizer.quick_gc()
+                continue
             try:
                 # quick_gc é leve, roda sempre; run_check decide se faz otimização pesada
                 self._ram_optimizer.quick_gc()
@@ -2471,6 +2511,10 @@ class JarvisLive:
         """Check user-configured topics once per day; speak alerts when new headlines appear."""
         await asyncio.sleep(300)  # wait 5 min after startup before first check
         while True:
+            # Throttle when not in foreground: check every 2 hours instead of 30 min
+            if not self._foreground:
+                await asyncio.sleep(7200)
+                continue
             if self.session and self._awake:
                 # Don't interrupt if user spoke recently or JARVIS is mid-sentence
                 with self._speaking_lock:
@@ -2511,9 +2555,15 @@ class JarvisLive:
         to say proactively. No hardcoded rules — Gemini makes the call.
         """
         while True:
-            await asyncio.sleep(120)  # evaluate every 2 minutes
+            # Throttle when not in foreground: check every 10 min instead of 2 min
+            sleep_interval = 120 if self._foreground else 600
+            await asyncio.sleep(sleep_interval)
 
             if not self.session or not self._awake:
+                continue
+
+            # Skip proactive mode when not in foreground
+            if not self._foreground:
                 continue
 
             with self._speaking_lock:
@@ -3070,6 +3120,17 @@ class JarvisLive:
 
 def main():
     ui = JarvisUI("face.png")
+
+    # Install git guard hook on startup to protect intimate/sensitive data
+    try:
+        from memory.git_guard import get_git_guard
+        guard = get_git_guard()
+        if guard.install_hook():
+            print("[GitGuard] ✅ Pre-commit hook active - intimate data protected")
+        else:
+            print("[GitGuard] ⚠️ Could not install hook")
+    except Exception as e:
+        print(f"[GitGuard] ⚠️ {e}")
 
     def runner():
         ui.wait_for_api_key()

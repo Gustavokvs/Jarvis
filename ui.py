@@ -29,7 +29,7 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
     QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
-    QUrl, pyqtSignal,
+    QUrl, pyqtSignal, QEvent,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
@@ -4253,6 +4253,7 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _focus_sig       = pyqtSignal(bool)      # True=window gained focus, False=lost focus
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4557,6 +4558,23 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+
+        # Focus tracking callback (set by JarvisLive)
+        self._focus_callback = None
+
+    def changeEvent(self, event: QEvent) -> None:
+        """Track window activation/focus changes for foreground/background throttling."""
+        if event.type() == QEvent.Type.ActivationChange:
+            is_active = self.isActiveWindow()
+            self._focus_sig.emit(is_active)
+            if self._focus_callback:
+                # Call the callback in the Qt thread
+                self._focus_callback(is_active)
+        super().changeEvent(event)
+
+    def set_focus_callback(self, callback):
+        """Set callback to be called when window focus changes. Callback receives (is_active: bool)."""
+        self._focus_callback = callback
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -6992,6 +7010,10 @@ class JarvisUI:
     @on_voice_change.setter
     def on_voice_change(self, cb):
         self._win.on_voice_change = cb
+
+    def set_focus_callback(self, callback):
+        """Set callback to be called when window focus changes. Callback receives (is_active: bool)."""
+        self._win.set_focus_callback(callback)
 
     @property
     def on_audio_device_change(self):

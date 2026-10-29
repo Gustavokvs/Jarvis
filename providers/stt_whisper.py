@@ -135,18 +135,28 @@ class WhisperSTT:
             return self._model
 
     def _transcribe_blocking(self, samples) -> str:
-        segments, info = self._model.transcribe(
-            samples,
-            language=self.language or None,     # None = detect it
-            beam_size=1,          # greedy: a voice command is short and beam
-                                  # search costs multiples of the time for an
-                                  # accuracy gain that does not show up here
-            vad_filter=True,      # drops the silence a push-to-talk release
-                                  # leaves at both ends, which Whisper otherwise
-                                  # fills with an invented sentence
-            condition_on_previous_text=False,   # stops one bad transcript from
-                                                # steering every one after it
-        )
+        # VAD filter requires onnxruntime which isn't available on Python 3.15+
+        # Try with VAD first, fall back to without VAD if it fails
+        try:
+            segments, info = self._model.transcribe(
+                samples,
+                language=self.language or None,
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+        except Exception as e:
+            if "onnxruntime" in str(e).lower() or "vad" in str(e).lower():
+                # Fallback without VAD filter
+                segments, info = self._model.transcribe(
+                    samples,
+                    language=self.language or None,
+                    beam_size=1,
+                    vad_filter=False,
+                    condition_on_previous_text=False,
+                )
+            else:
+                raise
         # The work happens HERE — `segments` is a generator.
         text = " ".join(s.text.strip() for s in segments).strip()
         self._accept_language(

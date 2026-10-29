@@ -49,6 +49,12 @@ logs/
 downloads/
 screenshots/
 config/api_keys.json
+config/*_token.json
+config/google_credentials.json
+config/caldav.json
 backups_ia/
 temp/
 whatsapp_session/
+memory/secure/
+*.bak
+ultimo_crash.log
